@@ -1,5 +1,5 @@
 // Grasshopper Script Instance - NON-PLANAR EXTRUSION MULTIPLIER CALCULATION
-// 
+//
 // INPUTS:
 //   segments       - Tree  - Line segments in print order (any structure: branches, spirals, mixed)
 //   nomGap         - Item  - Nominal gap between layers (default: 1.0mm)
@@ -19,6 +19,22 @@
 //   debugLines    - Debug: vertical lines showing gap from segment midpoint to support
 //   beadMesh      - Debug: the mesh used for ray intersection
 //
+// GRASSHOPPER WIRING (component nickname: "Nonplanar"):
+//   Inputs:
+//     segments       ← "Print segments" Curve parameter (tree of line-like curves)
+//     nomGap         ← Panel (value: "1")
+//     extrusionWidth ← Panel (value: "2")
+//     samplesPerSeg  ← Number Slider (integer, value: 9)
+//     minGapFraction ← Number Slider (value: 0.1)
+//     minMult        ← "Min extrusion mult" Number Slider (value: 0.25)
+//     maxMult        ← "Max extrusion mult" Number Slider (value: 1.75)
+//     showDebug      ← Boolean Toggle (value: True)
+//   Outputs:
+//     multipliers    → Number parameter, Bounds component, Gradient component, Panel
+//     summary        → "nonplanar-summary" Panel
+//     debugLines     → Line parameter
+//     beadMesh       → Mesh parameter
+//
 // ALGORITHM:
 // Mesh-based ray casting approach:
 //
@@ -29,11 +45,11 @@
 //
 // Pass 2 - Ray Casting:
 //   For each segment, cast rays at samplesPerSeg positions along the segment.
-//   At each position, cast 3 rays: center and ±1/3 extrusionWidth perpendicular to segment.
-//   This captures gap variation across bead width on angled walls.
+//   At each position, cast center ray first. If center misses, cast ±20% extrusionWidth
+//   perpendicular offset rays as fallback and use closest support found.
 //   Filter hits to require minimum Z gap (filters same-layer hits in spirals).
 //   Use actual mesh hit Z for accurate gap calculation with extended quads.
-//   Average all valid gaps across samples and offsets.
+//   Average valid gaps across sample positions along segment.
 //   Multiplier = avgGap / nomGap
 //
 // VERSION HISTORY:
@@ -45,6 +61,10 @@
 //        (interpolation was wrong for hits on extended portions of mesh quads)
 //   v6 - Fixed mesh winding order for zig-zag paths: ensure consistent perpendicular direction
 //        so all faces have upward normals (rays were missing faces with downward normals)
+//   v7 - Fixed edge blowout: perpendicular offset rays at form edges would miss nearby support
+//        and find distant faces far below, dragging the average wildly wrong. Now center ray
+//        is primary; offset rays (reduced to ±20% width) only cast as fallback when center
+//        misses. Take closest support from fallback rays instead of averaging all rays.
 
 #region Usings
 using System;
@@ -95,9 +115,8 @@ public class Script_Instance : GH_ScriptInstance
         // Minimum Z gap to consider valid support - filters same-layer hits in spirals
         double minZGap = nomGap * minGapFraction;
         
-        // Perpendicular offsets: center and ±1/3 of extrusion width
-        double perpOffset = extrusionWidth / 3.0;
-        double[] perpOffsets = new double[] { -perpOffset, 0, perpOffset };
+        // Perpendicular offset for fallback rays: ±20% of extrusion width
+        double perpOffset = extrusionWidth * 0.2;
         
         var timer = Stopwatch.StartNew();
         
@@ -226,7 +245,7 @@ public class Script_Instance : GH_ScriptInstance
         var allDebugLines = showDebug ? new Line[totalSegments] : null;
         
         // Statistics
-        int withSupport = 0, withoutSupport = 0, skippedSameLayer = 0;
+        int withSupport = 0, withoutSupport = 0, skippedSameLayer = 0, invalidSamples = 0;
         double minGapFound = double.MaxValue, maxGapFound = double.MinValue;
         double minMultFound = double.MaxValue, maxMultFound = double.MinValue;
         double multSum = 0;
@@ -249,89 +268,86 @@ public class Script_Instance : GH_ScriptInstance
             sampleTs[i] = 0.1 + 0.8 * i / Math.Max(1, samplesPerSeg - 1);
         }
         if (samplesPerSeg == 1) sampleTs[0] = 0.5; // Single sample at midpoint
-        
-        int totalRaysPerSegment = samplesPerSeg * perpOffsets.Length;
-        
+
         Parallel.For(0, totalSegments, segIdx =>
         {
             Line seg = allSegments[segIdx];
             Vector3d perpUnit = perpUnits[segIdx];
             
-            // Sample at multiple points along segment and across bead width
+            // Sample at multiple points along segment; center ray first with offset fallback
             int validSamples = 0;
             double gapSum = 0;
             double bestGap = double.MaxValue;
             int localSkippedSameLayer = 0;
-            
+            int localInvalidSamples = 0;
+
+            // Rays: center first, then offset rays as fallback if center misses
+            double[] rayOffsets = new double[] { 0, -perpOffset, perpOffset };
+
             foreach (double t in sampleTs)
             {
                 Point3d centerPt = seg.PointAt(t);
-                
-                // Cast rays at center and perpendicular offsets
-                foreach (double offset in perpOffsets)
+                double posGap = double.MaxValue;
+                bool posHasHit = false;
+
+                for (int ri = 0; ri < rayOffsets.Length; ri++)
                 {
+                    // Skip offset rays if center ray (ri==0) already found support
+                    if (ri == 1 && posHasHit) break;
+
                     Point3d samplePt = new Point3d(
-                        centerPt.X + perpUnit.X * offset,
-                        centerPt.Y + perpUnit.Y * offset,
-                        centerPt.Z
-                    );
-                    
+                        centerPt.X + perpUnit.X * rayOffsets[ri],
+                        centerPt.Y + perpUnit.Y * rayOffsets[ri],
+                        centerPt.Z);
+
                     // Cast ray downward from sample point
                     Point3d rayEnd = new Point3d(samplePt.X, samplePt.Y, minZ - 10);
                     Line ray = new Line(samplePt, rayEnd);
-                    
+
                     // Find all mesh intersections
                     Point3d[] hits;
                     int[] faceIds;
                     hits = Intersection.MeshLine(mesh, ray, out faceIds);
-                    
-                    // Find highest valid hit for this sample
-                    double sampleBestZ = double.MinValue;
-                    
+
                     if (hits != null)
                     {
-                        // Find highest hit from any earlier segment that's far enough below
                         for (int i = 0; i < hits.Length; i++)
                         {
                             int hitFaceIdx = faceIds[i];
-                            
+
                             // Must be from earlier segment
                             if (hitFaceIdx < segIdx)
                             {
-                                // Use actual mesh hit Z (not interpolated segment Z)
-                                // This correctly handles extended mesh quads where Z extends
-                                // beyond the original segment endpoints
                                 double hitZ = hits[i].Z;
 
-                                // Must be far enough below us (filters same-layer hits in spirals)
+                                // Must be far enough below (filters same-layer hits)
                                 if (hitZ < samplePt.Z - minZGap)
                                 {
-                                    if (hitZ > sampleBestZ)
+                                    double g = samplePt.Z - hitZ;
+                                    if (g < posGap)
                                     {
-                                        sampleBestZ = hitZ;
+                                        posGap = g;
+                                        posHasHit = true;
                                     }
                                 }
                                 else if (hitZ < samplePt.Z)
                                 {
-                                    // This hit was below us but filtered out by minZGap
                                     localSkippedSameLayer++;
                                 }
                             }
                         }
                     }
-                    
-                    if (sampleBestZ > double.MinValue)
-                    {
-                        double sampleGap = samplePt.Z - sampleBestZ;
-                        gapSum += sampleGap;
-                        validSamples++;
-                        
-                        // Track smallest gap for debug visualization
-                        if (sampleGap < bestGap)
-                        {
-                            bestGap = sampleGap;
-                        }
-                    }
+                }
+
+                if (posHasHit)
+                {
+                    gapSum += posGap;
+                    validSamples++;
+                    if (posGap < bestGap) bestGap = posGap;
+                }
+                else
+                {
+                    localInvalidSamples++;
                 }
             }
             
@@ -343,8 +359,11 @@ public class Script_Instance : GH_ScriptInstance
             {
                 double avgGap = gapSum / validSamples;
                 double rawMult = avgGap / nomGap;
-                mult = Math.Max(minMult, Math.Min(maxMult, rawMult));
-                
+                if (rawMult > maxMult)
+                    mult = 1.0; // Overhang: gap too large, use default flow
+                else
+                    mult = Math.Max(minMult, rawMult);
+
                 if (Math.Abs(mult - rawMult) > 0.1)
                     Interlocked.Increment(ref clampedCount);
                 
@@ -357,6 +376,7 @@ public class Script_Instance : GH_ScriptInstance
                     if (mult > maxMultFound) maxMultFound = mult;
                     multSum += mult;
                     skippedSameLayer += localSkippedSameLayer;
+                    invalidSamples += localInvalidSamples;
                 }
                 
                 if (showDebug)
@@ -376,6 +396,8 @@ public class Script_Instance : GH_ScriptInstance
                     if (mult > maxMultFound) maxMultFound = mult;
                     multSum += mult;
                     skippedSameLayer += localSkippedSameLayer;
+                    // Don't count invalid samples for no-support segments;
+                    // they're already reported as "without support"
                 }
                 
                 if (showDebug)
@@ -417,21 +439,22 @@ public class Script_Instance : GH_ScriptInstance
         
         // Generate summary
         var report = new StringBuilder();
-        report.AppendLine("=== NON-PLANAR EXTRUSION MULTIPLIER (MESH RAY CAST v6) ===");
+        report.AppendLine("=== NON-PLANAR EXTRUSION MULTIPLIER (MESH RAY CAST v7) ===");
         report.AppendLine($"Segments: {totalSegments:N0} | Mesh faces: {mesh.Faces.Count:N0}");
-        report.AppendLine($"Rays per segment: {totalRaysPerSegment} ({samplesPerSeg} along × 3 across) | Total rays: {totalSegments * totalRaysPerSegment:N0}");
+        report.AppendLine($"Samples: {samplesPerSeg} per segment (center ray + ±{perpOffset:F2}mm fallback offsets)");
         report.AppendLine($"Time: {timer.ElapsedMilliseconds}ms (mesh build: {meshBuildTime}ms)");
         report.AppendLine($"Settings: nomGap={nomGap}mm, extrusionWidth={extrusionWidth}mm");
-        report.AppendLine($"Perpendicular offsets: ±{perpOffset:F2}mm (1/3 of extrusion width)");
         report.AppendLine($"Min gap filter: {minGapFraction:P0} of nomGap = {minZGap:F3}mm");
         report.AppendLine($"Multiplier clamp: [{minMult:F3}, {maxMult}]");
         report.AppendLine();
-        
+
         report.AppendLine($"With support: {withSupport:N0} ({100.0*withSupport/totalSegments:F1}%)");
         report.AppendLine($"Without support (first layer): {withoutSupport:N0}");
+        if (invalidSamples > 0)
+            report.AppendLine($"Invalid samples (no ray hit): {invalidSamples:N0}");
         if (skippedSameLayer > 0)
             report.AppendLine($"Same-layer hits filtered: {skippedSameLayer:N0}");
-        
+
         if (withSupport > 0)
         {
             report.AppendLine($"Gap range: {minGapFound:F3} - {maxGapFound:F2}mm");
