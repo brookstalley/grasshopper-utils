@@ -12,6 +12,9 @@
 //   minMult        - Item  - Minimum multiplier clamp (default: 0.003)
 //   maxMult        - Item  - Maximum multiplier clamp (default: 3.0)
 //   showDebug      - Item  - Show debug visualization (default: false)
+//   baseZ          - Item  - Z height of base-to-form transition. Segments above this Z whose
+//                            closest support is below this Z use default multiplier (1.0) for
+//                            strong adhesion. 0 = disabled. (default: 0)
 //
 // OUTPUTS:
 //   multipliers   - Multipliers for each segment (matches input tree structure)
@@ -29,6 +32,7 @@
 //     minMult        ← "Min extrusion mult" Number Slider (value: 0.25)
 //     maxMult        ← "Max extrusion mult" Number Slider (value: 1.75)
 //     showDebug      ← Boolean Toggle (value: True)
+//     baseZ          ← Panel (value: "0", or Z height of base top)
 //   Outputs:
 //     multipliers    → Number parameter, Bounds component, Gradient component, Panel
 //     summary        → "nonplanar-summary" Panel
@@ -51,6 +55,7 @@
 //   Use actual mesh hit Z for accurate gap calculation with extended quads.
 //   Average valid gaps across sample positions along segment.
 //   Multiplier = avgGap / nomGap
+//   Overhangs (rawMult > maxMult) and cross-section transitions (baseAdhesion) use default 1.0
 //
 // VERSION HISTORY:
 //   v1 - Original mesh ray cast approach
@@ -65,6 +70,9 @@
 //        and find distant faces far below, dragging the average wildly wrong. Now center ray
 //        is primary; offset rays (reduced to ±20% width) only cast as fallback when center
 //        misses. Take closest support from fallback rays instead of averaging all rays.
+//        Overhangs (rawMult > maxMult) use default multiplier 1.0 instead of clamping to max.
+//        Added baseZ: Z-height threshold for base adhesion. Segments above baseZ supported
+//        by faces below baseZ use default multiplier for strong adhesion at transitions.
 
 #region Usings
 using System;
@@ -87,7 +95,7 @@ using Grasshopper.Kernel.Types;
 public class Script_Instance : GH_ScriptInstance
 {
     private void RunScript(
-		DataTree<Line> segments,
+		DataTree<object> segments,
 		double nomGap,
 		double extrusionWidth,
 		int samplesPerSeg,
@@ -95,6 +103,7 @@ public class Script_Instance : GH_ScriptInstance
 		double minMult,
 		double maxMult,
 		bool showDebug,
+		object baseZInput,
 		ref object multipliers,
 		ref object summary,
 		ref object debugLines,
@@ -111,7 +120,14 @@ public class Script_Instance : GH_ScriptInstance
         if (minGapFraction == 0) minGapFraction = 0.4;
         if (minMult <= 0) minMult = 0.003;
         if (maxMult <= 0) maxMult = 3.0;
-        
+
+        // Convert baseZ from object (Generic Data parameter)
+        double baseZ = 0;
+        if (baseZInput is double) baseZ = (double)baseZInput;
+        else if (baseZInput is int) baseZ = (int)baseZInput;
+        else if (baseZInput is GH_Number) baseZ = ((GH_Number)baseZInput).Value;
+        else if (baseZInput != null) double.TryParse(baseZInput.ToString(), out baseZ);
+
         // Minimum Z gap to consider valid support - filters same-layer hits in spirals
         double minZGap = nomGap * minGapFraction;
         
@@ -131,9 +147,18 @@ public class Script_Instance : GH_ScriptInstance
         for (int b = 0; b < pathCount; b++)
         {
             branchStarts[b] = allSegments.Count;
-            List<Line> branch = segments.Branch(paths[b]);
-            branchCounts[b] = branch.Count;
-            allSegments.AddRange(branch);
+            var branch = segments.Branch(paths[b]);
+            for (int i = 0; i < branch.Count; i++)
+            {
+                object item = branch[i];
+                if (item is Line)
+                    allSegments.Add((Line)item);
+                else if (item is GH_Line)
+                    allSegments.Add(((GH_Line)item).Value);
+                else if (item is Rhino.Geometry.LineCurve)
+                    allSegments.Add(((Rhino.Geometry.LineCurve)item).Line);
+            }
+            branchCounts[b] = allSegments.Count - branchStarts[b];
         }
         
         int totalSegments = allSegments.Count;
@@ -245,7 +270,7 @@ public class Script_Instance : GH_ScriptInstance
         var allDebugLines = showDebug ? new Line[totalSegments] : null;
         
         // Statistics
-        int withSupport = 0, withoutSupport = 0, skippedSameLayer = 0, invalidSamples = 0;
+        int withSupport = 0, withoutSupport = 0, skippedSameLayer = 0, invalidSamples = 0, adhesionOverride = 0;
         double minGapFound = double.MaxValue, maxGapFound = double.MinValue;
         double minMultFound = double.MaxValue, maxMultFound = double.MinValue;
         double multSum = 0;
@@ -280,6 +305,7 @@ public class Script_Instance : GH_ScriptInstance
             double bestGap = double.MaxValue;
             int localSkippedSameLayer = 0;
             int localInvalidSamples = 0;
+            int localCrossZ = 0;
 
             // Rays: center first, then offset rays as fallback if center misses
             double[] rayOffsets = new double[] { 0, -perpOffset, perpOffset };
@@ -344,6 +370,9 @@ public class Script_Instance : GH_ScriptInstance
                     gapSum += posGap;
                     validSamples++;
                     if (posGap < bestGap) bestGap = posGap;
+                    // Cross-Z-boundary: segment above baseZ, support below baseZ
+                    if (baseZ > 0 && centerPt.Z > baseZ && (centerPt.Z - posGap) < baseZ)
+                        localCrossZ++;
                 }
                 else
                 {
@@ -359,7 +388,12 @@ public class Script_Instance : GH_ScriptInstance
             {
                 double avgGap = gapSum / validSamples;
                 double rawMult = avgGap / nomGap;
-                if (rawMult > maxMult)
+                if (baseZ > 0 && localCrossZ * 2 > validSamples)
+                {
+                    mult = 1.0; // Base adhesion: support is below baseZ threshold
+                    Interlocked.Increment(ref adhesionOverride);
+                }
+                else if (rawMult > maxMult)
                     mult = 1.0; // Overhang: gap too large, use default flow
                 else
                     mult = Math.Max(minMult, rawMult);
@@ -440,28 +474,33 @@ public class Script_Instance : GH_ScriptInstance
         // Generate summary
         var report = new StringBuilder();
         report.AppendLine("=== NON-PLANAR EXTRUSION MULTIPLIER (MESH RAY CAST v7) ===");
-        report.AppendLine($"Segments: {totalSegments:N0} | Mesh faces: {mesh.Faces.Count:N0}");
-        report.AppendLine($"Samples: {samplesPerSeg} per segment (center ray + ±{perpOffset:F2}mm fallback offsets)");
-        report.AppendLine($"Time: {timer.ElapsedMilliseconds}ms (mesh build: {meshBuildTime}ms)");
-        report.AppendLine($"Settings: nomGap={nomGap}mm, extrusionWidth={extrusionWidth}mm");
-        report.AppendLine($"Min gap filter: {minGapFraction:P0} of nomGap = {minZGap:F3}mm");
-        report.AppendLine($"Multiplier clamp: [{minMult:F3}, {maxMult}]");
+
+        report.AppendLine(String.Format("Segments: {0:N0} | Mesh faces: {1:N0}", totalSegments, mesh.Faces.Count));
+        report.AppendLine(String.Format("Samples: {0} per segment (center ray + +/-{1:F2}mm fallback offsets)", samplesPerSeg, perpOffset));
+        report.AppendLine(String.Format("Time: {0}ms (mesh build: {1}ms)", timer.ElapsedMilliseconds, meshBuildTime));
+        report.AppendLine(String.Format("Settings: nomGap={0}mm, extrusionWidth={1}mm", nomGap, extrusionWidth));
+        report.AppendLine(String.Format("Min gap filter: {0:P0} of nomGap = {1:F3}mm", minGapFraction, minZGap));
+        report.AppendLine(String.Format("Multiplier clamp: [{0:F3}, {1}] (overhang > max = 1.0)", minMult, maxMult));
+        if (baseZ > 0)
+            report.AppendLine(String.Format("Base adhesion: Z < {0}mm = 1.0", baseZ));
         report.AppendLine();
 
-        report.AppendLine($"With support: {withSupport:N0} ({100.0*withSupport/totalSegments:F1}%)");
-        report.AppendLine($"Without support (first layer): {withoutSupport:N0}");
+        report.AppendLine(String.Format("With support: {0:N0} ({1:F1}%)", withSupport, 100.0*withSupport/totalSegments));
+        report.AppendLine(String.Format("Without support (first layer): {0:N0}", withoutSupport));
         if (invalidSamples > 0)
-            report.AppendLine($"Invalid samples (no ray hit): {invalidSamples:N0}");
+            report.AppendLine(String.Format("Invalid samples (no ray hit): {0:N0}", invalidSamples));
         if (skippedSameLayer > 0)
-            report.AppendLine($"Same-layer hits filtered: {skippedSameLayer:N0}");
+            report.AppendLine(String.Format("Same-layer hits filtered: {0:N0}", skippedSameLayer));
 
         if (withSupport > 0)
         {
-            report.AppendLine($"Gap range: {minGapFound:F3} - {maxGapFound:F2}mm");
-            report.AppendLine($"Multiplier range: {minMultFound:F3} - {maxMultFound:F2}");
-            report.AppendLine($"Multiplier avg: {multSum/totalSegments:F3}");
+            report.AppendLine(String.Format("Gap range: {0:F3} - {1:F2}mm", minGapFound, maxGapFound));
+            report.AppendLine(String.Format("Multiplier range: {0:F3} - {1:F2}", minMultFound, maxMultFound));
+            report.AppendLine(String.Format("Multiplier avg: {0:F3}", multSum/totalSegments));
             if (clampedCount > 0)
-                report.AppendLine($"Clamped: {clampedCount:N0}");
+                report.AppendLine(String.Format("Clamped: {0:N0}", clampedCount));
+            if (adhesionOverride > 0)
+                report.AppendLine(String.Format("Base adhesion override: {0:N0}", adhesionOverride));
         }
         
         // Set outputs
