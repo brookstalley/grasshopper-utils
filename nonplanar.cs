@@ -12,9 +12,10 @@
 //   minMult        - Item  - Minimum multiplier clamp (default: 0.003)
 //   maxMult        - Item  - Maximum multiplier clamp (default: 3.0)
 //   showDebug      - Item  - Show debug visualization (default: false)
-//   baseZ          - Item  - Z height of base-to-form transition. Segments above this Z whose
-//                            closest support is below this Z use default multiplier (1.0) for
-//                            strong adhesion. 0 = disabled. (default: 0)
+//   baseZ          - Item  - Z height of base-to-form transition. Segments at or below this Z
+//                            use default multiplier (1.0). Segments above this Z whose closest
+//                            support is below this Z also use default multiplier for strong
+//                            adhesion at transitions. 0 = disabled. (default: 0)
 //
 // OUTPUTS:
 //   multipliers   - Multipliers for each segment (matches input tree structure)
@@ -99,7 +100,7 @@ public class Script_Instance : GH_ScriptInstance
 		double nomGap,
 		double extrusionWidth,
 		int samplesPerSeg,
-		double minGapFraction,
+		object minGapFractionInput,
 		double minMult,
 		double maxMult,
 		bool showDebug,
@@ -114,12 +115,19 @@ public class Script_Instance : GH_ScriptInstance
         if (extrusionWidth <= 0) extrusionWidth = 2.0;
         if (samplesPerSeg < 1) samplesPerSeg = 1;
         if (samplesPerSeg > 10) samplesPerSeg = 10;
+        if (minMult <= 0) minMult = 0.003;
+        if (maxMult <= 0) maxMult = 3.0;
+
+        // Convert minGapFraction from object (Generic Data parameter)
+        double minGapFraction = 0;
+        if (minGapFractionInput is double) minGapFraction = (double)minGapFractionInput;
+        else if (minGapFractionInput is int) minGapFraction = (int)minGapFractionInput;
+        else if (minGapFractionInput is GH_Number) minGapFraction = ((GH_Number)minGapFractionInput).Value;
+        else if (minGapFractionInput != null) double.TryParse(minGapFractionInput.ToString(), out minGapFraction);
         if (minGapFraction < 0) minGapFraction = 0;
         if (minGapFraction > 0.9) minGapFraction = 0.9;
         // Default minGapFraction to 0.4 if not specified (input is 0)
         if (minGapFraction == 0) minGapFraction = 0.4;
-        if (minMult <= 0) minMult = 0.003;
-        if (maxMult <= 0) maxMult = 3.0;
 
         // Convert baseZ from object (Generic Data parameter)
         double baseZ = 0;
@@ -388,9 +396,16 @@ public class Script_Instance : GH_ScriptInstance
             {
                 double avgGap = gapSum / validSamples;
                 double rawMult = avgGap / nomGap;
-                if (baseZ > 0 && localCrossZ * 2 > validSamples)
+                // Base adhesion: segment at or below baseZ → default multiplier
+                if (baseZ > 0 && midPt.Z <= baseZ)
                 {
-                    mult = 1.0; // Base adhesion: support is below baseZ threshold
+                    mult = 1.0;
+                    Interlocked.Increment(ref adhesionOverride);
+                }
+                // Base adhesion: transition layer (above baseZ, supported below baseZ)
+                else if (baseZ > 0 && localCrossZ * 2 > validSamples)
+                {
+                    mult = 1.0;
                     Interlocked.Increment(ref adhesionOverride);
                 }
                 else if (rawMult > maxMult)
@@ -482,7 +497,7 @@ public class Script_Instance : GH_ScriptInstance
         report.AppendLine(String.Format("Min gap filter: {0:P0} of nomGap = {1:F3}mm", minGapFraction, minZGap));
         report.AppendLine(String.Format("Multiplier clamp: [{0:F3}, {1}] (overhang > max = 1.0)", minMult, maxMult));
         if (baseZ > 0)
-            report.AppendLine(String.Format("Base adhesion: Z < {0}mm = 1.0", baseZ));
+            report.AppendLine(String.Format("Base adhesion: Z <= {0}mm = 1.0 (+ transition layer)", baseZ));
         report.AppendLine();
 
         report.AppendLine(String.Format("With support: {0:N0} ({1:F1}%)", withSupport, 100.0*withSupport/totalSegments));
